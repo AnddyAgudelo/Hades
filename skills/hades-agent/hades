@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Hades CLI — Agent interface to the Hades orchestration platform
+# Requires: HADES_API_URL, HADES_API_KEY, curl, jq
+
+VERSION="1.0.0"
+
+# --- Configuration ---
+
+if [[ -z "${HADES_API_URL:-}" ]]; then
+  echo '{"error": "HADES_API_URL is not set"}' >&2
+  exit 1
+fi
+
+if [[ -z "${HADES_API_KEY:-}" ]]; then
+  echo '{"error": "HADES_API_KEY is not set"}' >&2
+  exit 1
+fi
+
+API="${HADES_API_URL}"
+AUTH="Authorization: Bearer ${HADES_API_KEY}"
+CT="Content-Type: application/json"
+
+# --- Helpers ---
+
+api_get() {
+  curl -sf -H "$AUTH" -H "$CT" "${API}${1}" 2>/dev/null
+}
+
+api_post() {
+  curl -sf -H "$AUTH" -H "$CT" -X POST -d "${2:-{}}" "${API}${1}" 2>/dev/null
+}
+
+die() {
+  echo "{\"error\": \"$1\"}" >&2
+  exit 1
+}
+
+require_arg() {
+  if [[ -z "${1:-}" ]]; then
+    die "Missing required argument: $2"
+  fi
+}
+
+# --- Commands ---
+
+cmd_status() {
+  local stats current
+  stats=$(api_get "/api/stats") || die "Failed to fetch stats"
+  current=$(api_get "/api/queue/current") || echo "null"
+  jq -n --argjson stats "$stats" --argjson current "$current" \
+    '{stats: $stats, currentTask: $current}'
+}
+
+cmd_claim() {
+  local agent_id="${1:-${HADES_AGENT_ID:-default}}"
+  local result
+  result=$(api_post "/api/agents/claim" "{\"agentId\": \"$agent_id\"}") || die "Failed to claim task"
+  echo "$result"
+}
+
+cmd_task() {
+  require_arg "${1:-}" "taskId"
+  # Use stats endpoint filtered — or just return from claim cache
+  # For now, use the queue current if it matches, otherwise note limitation
+  local current
+  current=$(api_get "/api/queue/current") || die "Failed to fetch current task"
+  echo "$current"
+}
+
+cmd_context() {
+  local ctx
+  ctx=$(api_get "/api/knowledge/context") || die "Failed to fetch context"
+  echo "$ctx"
+}
+
+cmd_log() {
+  require_arg "${1:-}" "taskId"
+  require_arg "${2:-}" "message"
+  api_post "/api/tasks/log" "{\"taskId\": \"$1\", \"entry\": \"$2\"}" || die "Failed to log"
+  echo '{"ok": true}'
+}
+
+cmd_complete() {
+  require_arg "${1:-}" "taskId"
+  local result="${2:-}"
+  api_post "/api/queue/complete" "{\"taskId\": \"$1\", \"result\": \"$result\"}" || die "Failed to complete"
+  echo '{"ok": true}'
+}
+
+cmd_block() {
+  require_arg "${1:-}" "taskId"
+  require_arg "${2:-}" "reason"
+  api_post "/api/queue/block" "{\"taskId\": \"$1\", \"reason\": \"$2\"}" || die "Failed to block"
+  echo '{"ok": true}'
+}
+
+cmd_retry() {
+  require_arg "${1:-}" "taskId"
+  local error="${2:-}"
+  api_post "/api/queue/retry" "{\"taskId\": \"$1\", \"error\": \"$error\"}" || die "Failed to retry"
+  echo '{"ok": true}'
+}
+
+cmd_create() {
+  local title="" priority="medium" repo="" branch="" description="" prompt="" feature=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --title) title="$2"; shift 2 ;;
+      --priority) priority="$2"; shift 2 ;;
+      --repo) repo="$2"; shift 2 ;;
+      --branch) branch="$2"; shift 2 ;;
+      --description) description="$2"; shift 2 ;;
+      --prompt) prompt="$2"; shift 2 ;;
+      --feature) feature="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
+  require_arg "$title" "--title"
+
+  local payload
+  payload=$(jq -n \
+    --arg title "$title" \
+    --arg priority "$priority" \
+    --arg repo "$repo" \
+    --arg branch "$branch" \
+    --arg description "$description" \
+    --arg prompt "$prompt" \
+    --arg feature "$feature" \
+    '{
+      title: $title,
+      priority: $priority
+    }
+    + (if $repo != "" then {repo: $repo} else {} end)
+    + (if $branch != "" then {branch: $branch} else {} end)
+    + (if $description != "" then {description: $description} else {} end)
+    + (if $prompt != "" then {agentPrompt: $prompt} else {} end)
+    + (if $feature != "" then {featureId: $feature} else {} end)
+    ')
+
+  api_post "/api/tasks" "$payload" || die "Failed to create task"
+}
+
+cmd_batch() {
+  local input
+  input=$(cat)
+  require_arg "$input" "JSON input from stdin"
+  api_post "/api/tasks/batch" "{\"tasks\": $input}" || die "Failed to batch create"
+}
+
+cmd_register() {
+  local name="" role="worker" agent_id="${HADES_AGENT_ID:-}"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name) name="$2"; shift 2 ;;
+      --role) role="$2"; shift 2 ;;
+      --id) agent_id="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
+  require_arg "$name" "--name"
+  if [[ -z "$agent_id" ]]; then
+    agent_id="$name"
+  fi
+
+  api_post "/api/agents/register" "{\"agentId\": \"$agent_id\", \"name\": \"$name\", \"role\": \"$role\"}" || die "Failed to register"
+}
+
+cmd_heartbeat() {
+  local agent_id="${1:-${HADES_AGENT_ID:-default}}"
+  api_post "/api/agents/heartbeat" "{\"agentId\": \"$agent_id\"}" || die "Failed to heartbeat"
+}
+
+cmd_upload() {
+  require_arg "${1:-}" "file path"
+  local file="$1"
+  local name="${2:-$(basename "$file")}"
+
+  if [[ ! -f "$file" ]]; then
+    die "File not found: $file"
+  fi
+
+  # Step 1: Get upload URL
+  local upload_url
+  upload_url=$(api_post "/api/knowledge/upload" "{}") || die "Upload not supported via CLI yet — use the Hades UI"
+
+  echo "$upload_url"
+}
+
+cmd_docs() {
+  local docs
+  docs=$(api_get "/api/knowledge") || die "Failed to fetch documents"
+  echo "$docs"
+}
+
+cmd_whoami() {
+  local agents
+  agents=$(api_get "/api/agents/status") || die "Failed to fetch agent info"
+  jq -n \
+    --arg url "$API" \
+    --arg key_prefix "${HADES_API_KEY:0:12}..." \
+    --argjson agents "$agents" \
+    '{apiUrl: $url, keyPrefix: $key_prefix, agents: $agents}'
+}
+
+cmd_help() {
+  cat <<'HELP'
+Hades CLI v1.0.0 — Agent interface to the Hades orchestration platform
+
+TASK CONSUMPTION:
+  hades status                           Queue overview
+  hades claim [agentId]                  Claim next available task
+  hades task <taskId>                    Get task details
+  hades context                          Get workspace knowledge hub
+  hades log <taskId> "message"           Report progress
+  hades complete <taskId> "result"       Mark task done
+  hades block <taskId> "reason"          Mark task blocked
+  hades retry <taskId> ["error"]         Retry failed task
+
+TASK CREATION:
+  hades create --title "..." [--priority high] [--repo "..."] [--description "..."]
+  hades batch < tasks.json               Batch create from JSON stdin
+
+AGENT MANAGEMENT:
+  hades register --name "..." [--role worker|orchestrator|reviewer]
+  hades heartbeat [agentId]              Send alive signal
+
+KNOWLEDGE HUB:
+  hades upload <file> [name]             Upload document
+  hades docs                             List workspace documents
+
+UTILITY:
+  hades whoami                           Show workspace and agent info
+  hades help                             Show this help
+
+ENVIRONMENT:
+  HADES_API_URL    Convex HTTP API URL (required)
+  HADES_API_KEY    Workspace API key (required)
+  HADES_AGENT_ID   Default agent ID (optional)
+HELP
+}
+
+# --- Main ---
+
+command="${1:-help}"
+shift || true
+
+case "$command" in
+  status)    cmd_status "$@" ;;
+  claim)     cmd_claim "$@" ;;
+  task)      cmd_task "$@" ;;
+  context)   cmd_context "$@" ;;
+  log)       cmd_log "$@" ;;
+  complete)  cmd_complete "$@" ;;
+  block)     cmd_block "$@" ;;
+  retry)     cmd_retry "$@" ;;
+  create)    cmd_create "$@" ;;
+  batch)     cmd_batch "$@" ;;
+  register)  cmd_register "$@" ;;
+  heartbeat) cmd_heartbeat "$@" ;;
+  upload)    cmd_upload "$@" ;;
+  docs)      cmd_docs "$@" ;;
+  whoami)    cmd_whoami "$@" ;;
+  help)      cmd_help ;;
+  version)   echo "{\"version\": \"$VERSION\"}" ;;
+  *)         die "Unknown command: $command. Run 'hades help' for usage." ;;
+esac
